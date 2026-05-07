@@ -18,3 +18,8 @@ void HAL_Delay(uint32_t ms)
     uint32_t start = ms_ticks;
     while ((ms_ticks - start) < ms);
 }
+
+uint32_t HAL_GetTick(void)
+{
+    return ms_ticks;
+}
