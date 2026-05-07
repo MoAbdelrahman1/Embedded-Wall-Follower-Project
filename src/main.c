@@ -8,6 +8,9 @@
 volatile uint32_t enc_right = 0; // PA6
 volatile uint32_t enc_left  = 0; // PA7
 
+static uint32_t enc_right_total = 0;
+static uint32_t enc_left_total  = 0;
+
 static void Encoder_Init_PA6_PA7(void)
 {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
@@ -29,10 +32,12 @@ void EXTI9_5_IRQHandler(void)
     if (EXTI->PR & (1U << 6)) {
         EXTI->PR = (1U << 6);
         enc_right++;
+        enc_right_total++;
     }
     if (EXTI->PR & (1U << 7)) {
         EXTI->PR = (1U << 7);
         enc_left++;
+        enc_left_total++;
     }
 }
 
@@ -47,13 +52,19 @@ void EXTI9_5_IRQHandler(void)
 /* --- Thresholds (tune these) --- */
 #define FRONT_WALL_CM 15
 #define SIDE_WALL_CM  12
+#define OPEN_CM       25
 
 /* --- Speeds (0..999) --- */
 #define FWD_SPEED     650
 #define TURN_SPEED    600
 
-/* --- Timed 90° turn (tune for your robot) --- */
-#define TURN_TIME_MS  550
+/* --- Encoder-based 90° turn --- */
+#define TURN_PULSES_90 200
+
+/* --- Stop if all clear for this long --- */
+#define CLEAR_HOLD_MS  1000
+
+#define MAX_TURNS      64
 
 typedef enum {
     S0_IDLE = 0,
@@ -65,16 +76,31 @@ typedef enum {
 } FSM_State_t;
 
 static FSM_State_t state = S0_IDLE;
+static FSM_State_t prev_state = S0_IDLE;
 static uint32_t state_start_ms = 0;
 static uint32_t last_send_ms = 0;
-static uint32_t last_sensor_ms = 0;
-static uint32_t last_wifi_ms = 0;
 static uint32_t last_enc_ms = 0;
+static uint32_t clear_start_ms = 0;
+
+static uint32_t turn_start_r = 0;
+static uint32_t turn_start_l = 0;
+
+static uint16_t turn_count = 0;
+static char turn_seq[MAX_TURNS + 1];
 
 static void set_state(FSM_State_t s)
 {
     state = s;
     state_start_ms = HAL_GetTick();
+}
+
+static void record_turn(char dir)
+{
+    if (turn_count < MAX_TURNS) {
+        turn_seq[turn_count] = dir;
+        turn_count++;
+        turn_seq[turn_count] = '\0';
+    }
 }
 
 int main(void)
@@ -95,6 +121,7 @@ int main(void)
         DBGLN("[System] WiFi Connection Failed - Proceeding in offline mode");
     }
 
+    turn_seq[0] = '\0';
     set_state(S1_FOLLOW_WALL);
 
     while (1) {
@@ -104,18 +131,6 @@ int main(void)
         uint32_t front = Ultrasonic_Read_cm(FRONT_TRIG, FRONT_ECHO);
         uint32_t left  = Ultrasonic_Read_cm(LEFT_TRIG,  LEFT_ECHO);
         uint32_t right = Ultrasonic_Read_cm(RIGHT_TRIG, RIGHT_ECHO);
-
-        /* Print sensor readings every 5 seconds */
-        // if (now - last_sensor_ms >= 5000) {
-        //     last_sensor_ms = now;
-        //     DBGF("F:%lu L:%lu R:%lu\n", front, left, right);
-        // }
-
-        /* Print WiFi status every 2 seconds */
-        // if (now - last_wifi_ms >= 2000) {
-        //     last_wifi_ms = now;
-        //     DBGF("[WiFi] Connected=%d\n", ESP_Wifi_IsConnected() ? 1 : 0);
-        // }
 
         /* Print encoder pulses every 1 second */
         if (now - last_enc_ms >= 1000) {
@@ -135,10 +150,29 @@ int main(void)
             }
         }
 
+        /* Detect state change to capture turn start counts */
+        if (state != prev_state) {
+            if (state == S2_TURN_LEFT || state == S3_TURN_RIGHT) {
+                turn_start_r = enc_right_total;
+                turn_start_l = enc_left_total;
+            }
+            prev_state = state;
+        }
+
         switch (state) {
         case S1_FOLLOW_WALL:
             Motor_Drive(&MotorA, MOTOR_FORWARD, FWD_SPEED);
             Motor_Drive(&MotorB, MOTOR_FORWARD, FWD_SPEED);
+
+            if (front > OPEN_CM && left > OPEN_CM && right > OPEN_CM) {
+                if (clear_start_ms == 0) {
+                    clear_start_ms = now;
+                } else if (now - clear_start_ms >= CLEAR_HOLD_MS) {
+                    set_state(S5_STOP);
+                }
+            } else {
+                clear_start_ms = 0;
+            }
 
             if (front < FRONT_WALL_CM) {
                 if (left > SIDE_WALL_CM && right <= SIDE_WALL_CM) {
@@ -160,7 +194,9 @@ int main(void)
         case S2_TURN_LEFT:
             Motor_Drive(&MotorA, MOTOR_BACKWARD, TURN_SPEED);
             Motor_Drive(&MotorB, MOTOR_FORWARD,  TURN_SPEED);
-            if (now - state_start_ms >= TURN_TIME_MS) {
+            if ((enc_right_total - turn_start_r) >= TURN_PULSES_90 ||
+                (enc_left_total  - turn_start_l) >= TURN_PULSES_90) {
+                record_turn('L');
                 set_state(S1_FOLLOW_WALL);
             }
             break;
@@ -168,7 +204,9 @@ int main(void)
         case S3_TURN_RIGHT:
             Motor_Drive(&MotorA, MOTOR_FORWARD,  TURN_SPEED);
             Motor_Drive(&MotorB, MOTOR_BACKWARD, TURN_SPEED);
-            if (now - state_start_ms >= TURN_TIME_MS) {
+            if ((enc_right_total - turn_start_r) >= TURN_PULSES_90 ||
+                (enc_left_total  - turn_start_l) >= TURN_PULSES_90) {
+                record_turn('R');
                 set_state(S1_FOLLOW_WALL);
             }
             break;
@@ -186,9 +224,16 @@ int main(void)
         default:
             Motor_Stop(&MotorA);
             Motor_Stop(&MotorB);
+            if (state == S5_STOP) {
+                DBGF("Turns: %u\n", turn_count);
+                DBGF("Sequence: %s\n", turn_seq);
+                while (1) {
+                    HAL_Delay(1000);
+                }
+            }
             break;
         }
 
-        HAL_Delay(100);
+        HAL_Delay(50);
     }
 }
