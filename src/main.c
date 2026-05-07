@@ -237,11 +237,21 @@ void EXTI9_5_IRQHandler(void)
         EXTI->PR = (1U << 6);
         enc_right++;
         enc_right_total++;
+        enc_right_total++;
     }
     if (EXTI->PR & (1U << 7)) {
         EXTI->PR = (1U << 7);
         enc_left++;
         enc_left_total++;
+    }
+}
+
+static void record_turn(char dir)
+{
+    if (turn_count < MAX_TURNS) {
+        turn_seq[turn_count] = dir;
+        turn_count++;
+        turn_seq[turn_count] = '\0';
     }
 }
 
