@@ -61,3 +61,27 @@ uint32_t Ultrasonic_Read_cm(void)
 
     return elapsed / 58U;      /* convert to cm */
 }
+uint32_t Ultrasonic_Read_us(void)
+{
+    uint32_t t_start, t_end;
+
+    /* Send 10µs TRIG pulse */
+    GPIOB->BSRR = (1U << TRIG_PIN);
+    delay_us(10);
+    GPIOB->BSRR = (1U << (TRIG_PIN + 16));
+
+    /* Wait for ECHO to go HIGH (timeout) */
+    t_start = TIM3->CNT;
+    while (!(GPIOB->IDR & (1U << ECHO_PIN))) {
+        if ((uint32_t)(TIM3->CNT - t_start) > 30000U) return 0U;
+    }
+
+    /* Measure ECHO HIGH width */
+    t_start = TIM3->CNT;
+    while (GPIOB->IDR & (1U << ECHO_PIN)) {
+        if ((uint32_t)(TIM3->CNT - t_start) > 30000U) return 0U;
+    }
+    t_end = TIM3->CNT;
+
+    return (uint32_t)(t_end - t_start);
+}
