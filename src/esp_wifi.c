@@ -144,6 +144,34 @@ bool ESP_Wifi_SendData(float distance) {
     _connected = false;
     return false;
 }
+
+bool ESP_Wifi_SendText(const char *msg)
+{
+    if (!_connected) return false;
+
+    int len = (int)strlen(msg);
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d\r\n", len);
+    _send(cmd);
+
+    if (!_waitFor(">", 5000)) {
+        DBGLN("[ESP] CIPSEND prompt failed");
+        _send("AT+CIPSTATUS\r\n");
+        _waitFor("STATUS", 2000);
+        _connected = false;
+        return false;
+    }
+
+    _send(msg);
+
+    if (_waitFor("SEND OK", 5000)) return true;
+
+    DBGLN("[ESP] SEND OK not received");
+    _connected = false;
+    return false;
+}
+
 bool ESP_Wifi_IsConnected(void) { return _connected; }
 
 void ESP_Wifi_Reconnect(void) {
