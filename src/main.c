@@ -3,6 +3,38 @@
 #include "motor.h"
 #include "ultrasonic.h"
 #include "debug.h"
+#include "esp_wifi.h"
+
+volatile uint32_t enc_right = 0; // PA6
+volatile uint32_t enc_left  = 0; // PA7
+
+static void Encoder_Init_PA6_PA7(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+    GPIOA->MODER &= ~((3U << (6*2)) | (3U << (7*2)));
+    GPIOA->PUPDR &= ~((3U << (6*2)) | (3U << (7*2)));
+    GPIOA->PUPDR |=  ((1U << (6*2)) | (1U << (7*2)));
+
+    SYSCFG->EXTICR[1] &= ~((0xFU << 8) | (0xFU << 12));
+    EXTI->IMR  |= (1U << 6) | (1U << 7);
+    EXTI->RTSR |= (1U << 6) | (1U << 7);
+
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    if (EXTI->PR & (1U << 6)) {
+        EXTI->PR = (1U << 6);
+        enc_right++;
+    }
+    if (EXTI->PR & (1U << 7)) {
+        EXTI->PR = (1U << 7);
+        enc_left++;
+    }
+}
 
 /* --- Sensor pins --- */
 #define FRONT_TRIG 4
@@ -34,6 +66,10 @@ typedef enum {
 
 static FSM_State_t state = S0_IDLE;
 static uint32_t state_start_ms = 0;
+static uint32_t last_send_ms = 0;
+static uint32_t last_sensor_ms = 0;
+static uint32_t last_wifi_ms = 0;
+static uint32_t last_enc_ms = 0;
 
 static void set_state(FSM_State_t s)
 {
@@ -47,18 +83,18 @@ int main(void)
     Debug_Init(115200);
     Motor_Init();
     Ultrasonic_Init();
-    
+    Encoder_Init_PA6_PA7();
+
+    DBGLN("--- Wall Follower System Started ---");
+
     ESP_Wifi_Init(115200);
     if (ESP_Wifi_Connect()) {
         DBGLN("[System] WiFi Connected and Ready");
+        last_send_ms = HAL_GetTick();
     } else {
         DBGLN("[System] WiFi Connection Failed - Proceeding in offline mode");
     }
-    
 
-    DBGLN("FSM Start");
-
-    /* Start immediately (no start button) */
     set_state(S1_FOLLOW_WALL);
 
     while (1) {
@@ -69,7 +105,35 @@ int main(void)
         uint32_t left  = Ultrasonic_Read_cm(LEFT_TRIG,  LEFT_ECHO);
         uint32_t right = Ultrasonic_Read_cm(RIGHT_TRIG, RIGHT_ECHO);
 
-        // DBGF("F:%lu L:%lu R:%lu\n", front, left, right);
+        /* Print sensor readings every 5 seconds */
+        // if (now - last_sensor_ms >= 5000) {
+        //     last_sensor_ms = now;
+        //     DBGF("F:%lu L:%lu R:%lu\n", front, left, right);
+        // }
+
+        /* Print WiFi status every 2 seconds */
+        // if (now - last_wifi_ms >= 2000) {
+        //     last_wifi_ms = now;
+        //     DBGF("[WiFi] Connected=%d\n", ESP_Wifi_IsConnected() ? 1 : 0);
+        // }
+
+        /* Print encoder pulses every 1 second */
+        if (now - last_enc_ms >= 1000) {
+            last_enc_ms = now;
+            DBGF("[ENC] R:%lu  L:%lu\n", enc_right, enc_left);
+            enc_right = 0;
+            enc_left  = 0;
+        }
+
+        /* Send front distance over WiFi every interval */
+        if (ESP_Wifi_IsConnected() && (now - last_send_ms >= SEND_INTERVAL_MS)) {
+            last_send_ms = now;
+            if (!ESP_Wifi_SendData((float)front)) {
+                DBGLN("[WiFi] Send failed");
+            } else {
+                DBGLN("[WiFi] Sent OK");
+            }
+        }
 
         switch (state) {
         case S1_FOLLOW_WALL:
@@ -84,7 +148,7 @@ int main(void)
                     set_state(S3_TURN_RIGHT);
                     DBGLN("TURN RIGHT");
                 } else if (left > SIDE_WALL_CM && right > SIDE_WALL_CM) {
-                    set_state(S2_TURN_LEFT); /* prefer left */
+                    set_state(S2_TURN_LEFT);
                     DBGLN("TURN LEFT (both open)");
                 } else {
                     set_state(S4_WALL_LOST);
@@ -110,7 +174,6 @@ int main(void)
             break;
 
         case S4_WALL_LOST:
-            /* slow forward search */
             Motor_Drive(&MotorA, MOTOR_FORWARD, 400);
             Motor_Drive(&MotorB, MOTOR_FORWARD, 400);
             if (front < FRONT_WALL_CM || left < SIDE_WALL_CM || right < SIDE_WALL_CM) {
@@ -126,6 +189,6 @@ int main(void)
             break;
         }
 
-        HAL_Delay(100); /* slow sensor prints */
+        HAL_Delay(100);
     }
 }
