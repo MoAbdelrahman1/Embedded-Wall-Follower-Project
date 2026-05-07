@@ -7,6 +7,7 @@
 /* ─── System / SysTick ─────────────────────────────────── */
 void System_Init(void);
 void HAL_Delay(uint32_t ms);
+uint32_t HAL_GetTick(void);
 
 /* ─── TIM2 microsecond timer ───────────────────────────── */
 void     TIM2_Init(void);

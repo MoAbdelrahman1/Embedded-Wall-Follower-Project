@@ -49,6 +49,11 @@ void HAL_Delay(uint32_t ms)
     while ((ms_ticks - start) < ms);
 }
 
+uint32_t HAL_GetTick(void)
+{
+    return ms_ticks;
+}
+
 void TIM2_Init(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
