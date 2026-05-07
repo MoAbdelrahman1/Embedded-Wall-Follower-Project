@@ -21,11 +21,18 @@
 #define STOP_DISTANCE   15U  /* stop if wall closer than 15 cm */
 
 /* WiFi credentials */
-#define WIFI_SSID        "YOUR_SSID"
-#define WIFI_PASS        "YOUR_PASSWORD"
+// #define WIFI_SSID        "Azima"
+// #define WIFI_PASS        "Azima2005"
 
-/* TCP server (your laptop running receiver.py) */
-#define SERVER_IP        "172.25.0.1"
+// /* TCP server (your laptop running receiver.py) */
+// #define SERVER_IP        "172.29.64.1"
+// #define SERVER_PORT      "5000"
+/* --- Robot WiFi Access Point Settings --- */
+#define ROBOT_SSID       "STM32_Wall_Follower"
+#define ROBOT_PASS       "12345678"
+
+/* The IP your laptop will get when connected to the Robot */
+#define SERVER_IP        "192.168.4.2"
 #define SERVER_PORT      "5000"
 
 /* UART pins for ESP-01S (USART6) */
