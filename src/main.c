@@ -22,8 +22,8 @@
 #define RIGHT_ECHO  9
 
 /* ── Distance thresholds (cm) ────────────────────────────── */
-#define FRONT_SLOW_CM        55
-#define FRONT_STOP_CM        20   /* wall is close → evaluate turn */
+#define FRONT_SLOW_CM        35
+#define FRONT_STOP_CM        27  /* wall is close - evaluate turn */
 #define FRONT_RESUME_CM      30
 #define SIDE_OPEN_CM         35   /* side reads THIS or more → corridor is open */
 #define TARGET_SIDE_CM       12
@@ -34,14 +34,19 @@
 /* ── Motor speeds (0–999) ────────────────────────────────── */
 #define FWD_SPEED            620
 #define SLOW_SPEED           380
-#define CORRECTION_SPEED     110
-#define CLOSE_CORRECTION     160
+#define PRE_TURN_SPEED       260
+#define CORRECTION_SPEED     140
+#define CLOSE_CORRECTION     200
 #define TURN_SPEED           450   /* each motor during spin */
 
 /* ── Turn timing — TUNE THIS ON YOUR ROBOT ───────────────── */
 /* Spin one motor fwd, other bwd at TURN_SPEED.
  * Start at 500 ms, bump ±50 ms until you get clean 90°.      */
-#define TURN_DURATION_MS     500
+#define TURN_PULSES_90       240
+#define TURN_TIMEOUT_MS      1500
+#define TURN_DURATION_MS     450
+#define POST_TURN_NO_ADJUST_MS 400
+#define POST_TURN_SLOW_ADJUST_MS 600
 
 /* ── Max turns the track can have ───────────────────────────*/
 #define MAX_TURNS            32
@@ -62,6 +67,43 @@ static FSM_State_t  state       = S_IDLE;
 static uint8_t      turn_count  = 0;
 static char         turn_seq[MAX_TURNS]; /* 'L' or 'R' */
 static uint32_t     turn_timer  = 0;     /* ms timestamp */
+static uint32_t     slow_adjust_until_ms = 0;
+static volatile uint32_t enc_right_total = 0;
+static volatile uint32_t enc_left_total  = 0;
+static uint32_t turn_start_right = 0;
+static uint32_t turn_start_left  = 0;
+static uint32_t turn_target_pulses = TURN_PULSES_90;
+
+static void Encoder_Init_PA6_PA7(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+    GPIOA->MODER &= ~((3U << (6U * 2U)) | (3U << (7U * 2U)));
+    GPIOA->PUPDR &= ~((3U << (6U * 2U)) | (3U << (7U * 2U)));
+    GPIOA->PUPDR |=  ((1U << (6U * 2U)) | (1U << (7U * 2U)));
+
+    SYSCFG->EXTICR[1] &= ~((0xFU << 8U) | (0xFU << 12U));
+    EXTI->IMR  |= (1U << 6U) | (1U << 7U);
+    EXTI->RTSR |= (1U << 6U) | (1U << 7U);
+    EXTI->FTSR &= ~((1U << 6U) | (1U << 7U));
+    EXTI->PR = (1U << 6U) | (1U << 7U);
+
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    if (EXTI->PR & (1U << 6U)) {
+        EXTI->PR = (1U << 6U);
+        enc_right_total++;
+    }
+
+    if (EXTI->PR & (1U << 7U)) {
+        EXTI->PR = (1U << 7U);
+        enc_left_total++;
+    }
+}
 
 /* ── Helpers ─────────────────────────────────────────────── */
 static uint16_t clamp(int32_t v)
@@ -115,6 +157,16 @@ static void log_turn(char dir)
     }
 }
 
+static void start_turn(FSM_State_t turn_state, char dir, uint32_t target_pulses)
+{
+    log_turn(dir);
+    turn_start_right = enc_right_total;
+    turn_start_left = enc_left_total;
+    turn_target_pulses = target_pulses;
+    turn_timer = HAL_GetTick();
+    state = turn_state;
+}
+
 /* Build and send the final summary string */
 static void send_summary(void)
 {
@@ -143,6 +195,7 @@ int main(void)
     Debug_Init(115200);
     Motor_Init();
     Ultrasonic_Init();
+    Encoder_Init_PA6_PA7();
 
     ESP_Wifi_Init(115200);
     if (ESP_Wifi_Connect())
@@ -167,12 +220,15 @@ int main(void)
         /* ─── DRIVE: normal wall centering ─────────────── */
         case S_DRIVE: {
             /* Approaching something in front → slow and evaluate */
-            if (front < FRONT_SLOW_CM) {
+            if (front < FRONT_STOP_CM) {
                 state = S_PRE_TURN;
                 break;
             }
 
-            uint16_t base = FWD_SPEED;
+            uint16_t base = ((front < FRONT_SLOW_CM) ||
+                             ((int32_t)(slow_adjust_until_ms - HAL_GetTick()) > 0))
+                          ? PRE_TURN_SPEED
+                          : FWD_SPEED;
             int32_t  lspd = base, rspd = base;
 
             if (left <= MIN_SIDE_CLEAR_CM && left < right) {
@@ -216,31 +272,27 @@ int main(void)
                 bool right_open = (right >= SIDE_OPEN_CM);
 
                 if (left_open && !right_open) {
-                    log_turn('L');
-                    turn_timer = HAL_GetTick();
-                    state = S_TURN_LEFT;
+                    start_turn(S_TURN_LEFT, 'L', TURN_PULSES_90);
                 } else if (right_open && !left_open) {
-                    log_turn('R');
-                    turn_timer = HAL_GetTick();
-                    state = S_TURN_RIGHT;
+                    start_turn(S_TURN_RIGHT, 'R', TURN_PULSES_90);
                 } else if (left_open && right_open) {
                     /* T-junction: prefer left (or change to 'R' if needed) */
                     DBGLN("[TURN] T-junction → choosing LEFT");
-                    log_turn('L');
-                    turn_timer = HAL_GetTick();
-                    state = S_TURN_LEFT;
+                    start_turn(S_TURN_LEFT, 'L', TURN_PULSES_90);
                 } else {
                     /* Dead end: U-turn (two left spins) — extend duration */
                     DBGLN("[TURN] Dead-end → U-turn");
                     log_turn('L');
                     log_turn('L');
+                    turn_start_right = enc_right_total;
+                    turn_start_left = enc_left_total;
+                    turn_target_pulses = TURN_PULSES_90 * 2U;
                     turn_timer = HAL_GetTick();
-                    /* Reuse S_TURN_LEFT; TURN_DURATION_MS * 2 handled below */
                     state = S_TURN_LEFT;
                 }
             } else {
                 /* Slowing toward front wall */
-                drive(SLOW_SPEED, SLOW_SPEED);
+                drive(PRE_TURN_SPEED, PRE_TURN_SPEED);
             }
             break;
         }
@@ -271,7 +323,8 @@ int main(void)
         case S_POST_TURN:
             drive(SLOW_SPEED, SLOW_SPEED);
             /* Give sensors 400 ms to stabilise, then resume */
-            if (HAL_GetTick() - turn_timer >= 400) {
+            if (HAL_GetTick() - turn_timer >= POST_TURN_NO_ADJUST_MS) {
+                slow_adjust_until_ms = HAL_GetTick() + POST_TURN_SLOW_ADJUST_MS;
                 state = S_DRIVE;
             }
             break;
