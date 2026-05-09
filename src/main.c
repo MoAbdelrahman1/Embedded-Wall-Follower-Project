@@ -24,39 +24,25 @@
 #define FRONT_SLOW_CM         55
 #define FRONT_STOP_CM         45
 #define FRONT_RESUME_CM       55
-#define FRONT_EMERGENCY_CM     9
-#define TURN_OPEN_CM          22
 
 /* --- Speeds (0..999) --- */
 #define FWD_SPEED            620
 #define SLOW_SPEED           420
 #define CORRECTION_SPEED     110
 #define CLOSE_CORRECTION_SPEED 160
-#define TURN_SPEED           430
-#define RECOVERY_SPEED       360
-
-/* --- Timed movement (tune for your robot) --- */
-#define TURN_TIME_MS         650
-#define RECOVERY_TIME_MS     350
 
 typedef enum {
     S0_IDLE = 0,
     S1_DRIVE_CENTERED,
-    S2_TURN_LEFT,
-    S3_TURN_RIGHT,
-    S4_RECOVER_REVERSE,
     S5_STOP
 } FSM_State_t;
 
 static FSM_State_t state = S0_IDLE;
-static uint32_t state_start_ms = 0;
-static FSM_State_t next_state = S1_DRIVE_CENTERED;
 static uint8_t front_stop_latched = 0;
 
 static void set_state(FSM_State_t s)
 {
     state = s;
-    state_start_ms = HAL_GetTick();
 }
 
 static uint16_t clamp_speed(int32_t speed)
@@ -76,12 +62,6 @@ static void stop_robot(void)
 {
     Motor_Stop(&MotorA);
     Motor_Stop(&MotorB);
-}
-
-static void recover_then(FSM_State_t after_recovery)
-{
-    next_state = after_recovery;
-    set_state(S4_RECOVER_REVERSE);
 }
 
 int main(void)
@@ -104,13 +84,9 @@ int main(void)
     set_state(S1_DRIVE_CENTERED);
 
     while (1) {
-        uint32_t now = HAL_GetTick();
-
         uint32_t front = Ultrasonic_Read_cm(FRONT_TRIG, FRONT_ECHO);
         uint32_t left  = Ultrasonic_Read_cm(LEFT_TRIG,  LEFT_ECHO);
         uint32_t right = Ultrasonic_Read_cm(RIGHT_TRIG, RIGHT_ECHO);
-
-        // DBGF("F:%lu L:%lu R:%lu\n", front, left, right);
 
         switch (state) {
         case S1_DRIVE_CENTERED: {
@@ -126,7 +102,6 @@ int main(void)
             }
 
             if (front_stop_latched) {
-                DBGLN("STOP: front obstacle");
                 stop_robot();
                 break;
             }
@@ -158,37 +133,6 @@ int main(void)
             drive_forward(clamp_speed(left_speed), clamp_speed(right_speed));
             break;
         }
-
-        case S2_TURN_LEFT:
-            Motor_Drive(&MotorA, MOTOR_BACKWARD, TURN_SPEED);
-            Motor_Drive(&MotorB, MOTOR_FORWARD,  TURN_SPEED);
-            if (front <= FRONT_EMERGENCY_CM) {
-                DBGLN("RECOVER: unsafe left turn");
-                recover_then(S2_TURN_LEFT);
-            } else if (now - state_start_ms >= TURN_TIME_MS) {
-                set_state(S1_DRIVE_CENTERED);
-            }
-            break;
-
-        case S3_TURN_RIGHT:
-            Motor_Drive(&MotorA, MOTOR_FORWARD,  TURN_SPEED);
-            Motor_Drive(&MotorB, MOTOR_BACKWARD, TURN_SPEED);
-            if (front <= FRONT_EMERGENCY_CM) {
-                DBGLN("RECOVER: unsafe right turn");
-                recover_then(S3_TURN_RIGHT);
-            } else if (now - state_start_ms >= TURN_TIME_MS) {
-                set_state(S1_DRIVE_CENTERED);
-            }
-            break;
-
-        case S4_RECOVER_REVERSE:
-            Motor_Drive(&MotorA, MOTOR_BACKWARD, RECOVERY_SPEED);
-            Motor_Drive(&MotorB, MOTOR_BACKWARD, RECOVERY_SPEED);
-            if (now - state_start_ms >= RECOVERY_TIME_MS) {
-                stop_robot();
-                set_state(next_state);
-            }
-            break;
 
         case S0_IDLE:
         case S5_STOP:
