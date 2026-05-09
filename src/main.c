@@ -1,61 +1,80 @@
+/* ============================================================
+ * main.c  –  90° Turn Detection Test
+ * Drop this in place of your existing main.c
+ * Tune TURN_DURATION_MS on the bench before committing.
+ * ============================================================ */
+
 #include "config.h"
 #include "hal.h"
 #include "motor.h"
 #include "ultrasonic.h"
 #include "debug.h"
 #include "esp_wifi.h"
+#include <string.h>
+#include <stdio.h>
 
-/* --- Sensor pins on GPIOB --- */
-#define FRONT_TRIG 4
-#define FRONT_ECHO 5
-#define LEFT_TRIG  6
-#define LEFT_ECHO  7
-#define RIGHT_TRIG 8
-#define RIGHT_ECHO 9
+/* ── Sensor pins (GPIOB) ─────────────────────────────────── */
+#define FRONT_TRIG  4
+#define FRONT_ECHO  5
+#define LEFT_TRIG   6
+#define LEFT_ECHO   7
+#define RIGHT_TRIG  8
+#define RIGHT_ECHO  9
 
-/* --- Track geometry / safety thresholds ---
- * Track width ~= 45 cm, robot width ~= 20 cm, so a centered robot has
- * about 12.5 cm clearance on each side.
- */
+/* ── Distance thresholds (cm) ────────────────────────────── */
+#define FRONT_SLOW_CM        55
+#define FRONT_STOP_CM        20   /* wall is close → evaluate turn */
+#define FRONT_RESUME_CM      30
+#define SIDE_OPEN_CM         35   /* side reads THIS or more → corridor is open */
 #define TARGET_SIDE_CM       12
-#define SIDE_TOLERANCE_CM     6
-#define MIN_SIDE_CLEAR_CM      6
-#define SIDE_AVOID_CM          9
-#define FRONT_SLOW_CM         55
-#define FRONT_STOP_CM         45
-#define FRONT_RESUME_CM       55
+#define SIDE_TOLERANCE_CM     4
+#define MIN_SIDE_CLEAR_CM     6
+#define SIDE_AVOID_CM         9
 
-/* --- Speeds (0..999) --- */
+/* ── Motor speeds (0–999) ────────────────────────────────── */
 #define FWD_SPEED            620
-#define SLOW_SPEED           420
+#define SLOW_SPEED           380
 #define CORRECTION_SPEED     110
-#define CLOSE_CORRECTION_SPEED 160
+#define CLOSE_CORRECTION     160
+#define TURN_SPEED           450   /* each motor during spin */
 
+/* ── Turn timing — TUNE THIS ON YOUR ROBOT ───────────────── */
+/* Spin one motor fwd, other bwd at TURN_SPEED.
+ * Start at 500 ms, bump ±50 ms until you get clean 90°.      */
+#define TURN_DURATION_MS     500
+
+/* ── Max turns the track can have ───────────────────────────*/
+#define MAX_TURNS            32
+
+/* ── FSM states ──────────────────────────────────────────── */
 typedef enum {
-    S0_IDLE = 0,
-    S1_DRIVE_CENTERED,
-    S5_STOP
+    S_IDLE = 0,
+    S_DRIVE,        /* normal wall-following */
+    S_PRE_TURN,     /* slowing down before turn */
+    S_TURN_LEFT,
+    S_TURN_RIGHT,
+    S_POST_TURN,    /* short straight to re-acquire walls */
+    S_STOP
 } FSM_State_t;
 
-static FSM_State_t state = S0_IDLE;
-static uint8_t front_stop_latched = 0;
+/* ── Global turn log ─────────────────────────────────────── */
+static FSM_State_t  state       = S_IDLE;
+static uint8_t      turn_count  = 0;
+static char         turn_seq[MAX_TURNS]; /* 'L' or 'R' */
+static uint32_t     turn_timer  = 0;     /* ms timestamp */
 
-static void set_state(FSM_State_t s)
+/* ── Helpers ─────────────────────────────────────────────── */
+static uint16_t clamp(int32_t v)
 {
-    state = s;
+    if (v < 0)   return 0;
+    if (v > 999) return 999;
+    return (uint16_t)v;
 }
 
-static uint16_t clamp_speed(int32_t speed)
+static void drive(uint16_t l, uint16_t r)
 {
-    if (speed < 0) return 0;
-    if (speed > 999) return 999;
-    return (uint16_t)speed;
-}
-
-static void drive_forward(uint16_t left_speed, uint16_t right_speed)
-{
-    Motor_Drive(&MotorA, MOTOR_FORWARD, left_speed);
-    Motor_Drive(&MotorB, MOTOR_FORWARD, right_speed);
+    Motor_Drive(&MotorA, MOTOR_FORWARD,  l);
+    Motor_Drive(&MotorB, MOTOR_FORWARD,  r);
 }
 
 static void stop_robot(void)
@@ -64,6 +83,60 @@ static void stop_robot(void)
     Motor_Stop(&MotorB);
 }
 
+/* Spin left: left motor back, right motor fwd */
+static void spin_left(void)
+{
+    Motor_Drive(&MotorA, MOTOR_BACKWARD, TURN_SPEED);
+    Motor_Drive(&MotorB, MOTOR_FORWARD,  TURN_SPEED);
+}
+
+/* Spin right: left motor fwd, right motor back */
+static void spin_right(void)
+{
+    Motor_Drive(&MotorA, MOTOR_FORWARD,  TURN_SPEED);
+    Motor_Drive(&MotorB, MOTOR_BACKWARD, TURN_SPEED);
+}
+
+/* Record turn and send over WiFi */
+static void log_turn(char dir)
+{
+    if (turn_count < MAX_TURNS)
+        turn_seq[turn_count] = dir;
+    turn_count++;
+
+    /* Debug immediately */
+    DBGF("[TURN #%d] %c\n", turn_count, dir);
+
+    /* Send live over WiFi if connected */
+    if (ESP_Wifi_IsConnected()) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "TURN:%c:%d\n", dir, turn_count);
+        ESP_Wifi_SendText(msg);
+    }
+}
+
+/* Build and send the final summary string */
+static void send_summary(void)
+{
+    char buf[128];
+    int  pos = 0;
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "Turns: %d\nSequence: ", turn_count);
+
+    for (uint8_t i = 0; i < turn_count && i < MAX_TURNS; i++) {
+        if (i > 0)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%c", turn_seq[i]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+
+    DBGF("%s", buf);
+    if (ESP_Wifi_IsConnected())
+        ESP_Wifi_SendText(buf);
+}
+
+/* ── Main ─────────────────────────────────────────────────── */
 int main(void)
 {
     System_Init();
@@ -72,75 +145,150 @@ int main(void)
     Ultrasonic_Init();
 
     ESP_Wifi_Init(115200);
-    if (ESP_Wifi_Connect()) {
-        DBGLN("[System] WiFi Connected and Ready");
-    } else {
-        DBGLN("[System] WiFi Connection Failed - Proceeding in offline mode");
-    }
+    if (ESP_Wifi_Connect())
+        DBGLN("[WiFi] Connected");
+    else
+        DBGLN("[WiFi] Offline mode");
 
-    DBGLN("FSM Start");
-
-    /* Start immediately (no start button). */
-    set_state(S1_DRIVE_CENTERED);
+    DBGLN("=== Turn-Test FSM Start ===");
+    state = S_DRIVE;
 
     while (1) {
         uint32_t front = Ultrasonic_Read_cm(FRONT_TRIG, FRONT_ECHO);
         uint32_t left  = Ultrasonic_Read_cm(LEFT_TRIG,  LEFT_ECHO);
         uint32_t right = Ultrasonic_Read_cm(RIGHT_TRIG, RIGHT_ECHO);
 
+        /* ── Live debug every loop (remove after tuning) ── */
+        DBGF("F:%3lu L:%3lu R:%3lu  state:%d\n",
+             front, left, right, (int)state);
+
         switch (state) {
-        case S1_DRIVE_CENTERED: {
-            uint16_t base_speed = (front < FRONT_SLOW_CM) ? SLOW_SPEED : FWD_SPEED;
-            int32_t left_speed = base_speed;
-            int32_t right_speed = base_speed;
-            int32_t side_error;
 
-            if (front < FRONT_STOP_CM) {
-                front_stop_latched = 1;
-            } else if (front_stop_latched && front >= FRONT_RESUME_CM) {
-                front_stop_latched = 0;
-            }
-
-            if (front_stop_latched) {
-                stop_robot();
+        /* ─── DRIVE: normal wall centering ─────────────── */
+        case S_DRIVE: {
+            /* Approaching something in front → slow and evaluate */
+            if (front < FRONT_SLOW_CM) {
+                state = S_PRE_TURN;
                 break;
             }
 
-            if (left <= MIN_SIDE_CLEAR_CM && left < right) {
-                /* Very close to left wall: slow right motor to drift right. */
-                left_speed = SLOW_SPEED;
-                right_speed = SLOW_SPEED - CLOSE_CORRECTION_SPEED;
-            } else if (right <= MIN_SIDE_CLEAR_CM && right < left) {
-                /* Very close to right wall: slow left motor to drift left. */
-                left_speed = SLOW_SPEED - CLOSE_CORRECTION_SPEED;
-                right_speed = SLOW_SPEED;
-            } else if (left < SIDE_AVOID_CM) {
-                /* Approaching left wall: slow right motor to drift right. */
-                right_speed -= CORRECTION_SPEED;
-            } else if (right < SIDE_AVOID_CM) {
-                /* Approaching right wall: slow left motor to drift left. */
-                left_speed -= CORRECTION_SPEED;
-            } else {
-                /* Keep centered when both side sensors see valid walls. */
-                side_error = (int32_t)left - (int32_t)right;
-                if (side_error > SIDE_TOLERANCE_CM) {
-                    left_speed -= CORRECTION_SPEED / 2;
-                } else if (side_error < -SIDE_TOLERANCE_CM) {
-                    right_speed -= CORRECTION_SPEED / 2;
-                }
-            }
+            uint16_t base = FWD_SPEED;
+            int32_t  lspd = base, rspd = base;
 
-            drive_forward(clamp_speed(left_speed), clamp_speed(right_speed));
+            if (left <= MIN_SIDE_CLEAR_CM && left < right) {
+                lspd = SLOW_SPEED;
+                rspd = SLOW_SPEED - CLOSE_CORRECTION;
+            } else if (right <= MIN_SIDE_CLEAR_CM && right < left) {
+                lspd = SLOW_SPEED - CLOSE_CORRECTION;
+                rspd = SLOW_SPEED;
+            } else if (left < SIDE_AVOID_CM) {
+                rspd -= CORRECTION_SPEED;
+            } else if (right < SIDE_AVOID_CM) {
+                lspd -= CORRECTION_SPEED;
+            } else {
+                int32_t err = (int32_t)left - (int32_t)right;
+                if      (err >  SIDE_TOLERANCE_CM) lspd -= CORRECTION_SPEED / 2;
+                else if (err < -SIDE_TOLERANCE_CM) rspd -= CORRECTION_SPEED / 2;
+            }
+            drive(clamp(lspd), clamp(rspd));
             break;
         }
 
-        case S0_IDLE:
-        case S5_STOP:
+        /* ─── PRE_TURN: stop, decide direction ─────────── */
+        case S_PRE_TURN: {
+            /* If front cleared again (false positive), go back */
+            if (front >= FRONT_RESUME_CM) {
+                state = S_DRIVE;
+                break;
+            }
+
+            /* Wall is genuinely blocking → stop and check sides */
+            if (front < FRONT_STOP_CM) {
+                stop_robot();
+                HAL_Delay(150); /* settle before reading sides */
+
+                /* Re-read after settling */
+                left  = Ultrasonic_Read_cm(LEFT_TRIG,  LEFT_ECHO);
+                right = Ultrasonic_Read_cm(RIGHT_TRIG, RIGHT_ECHO);
+                DBGF("[PRE_TURN] F:%lu L:%lu R:%lu\n", front, left, right);
+
+                bool left_open  = (left  >= SIDE_OPEN_CM);
+                bool right_open = (right >= SIDE_OPEN_CM);
+
+                if (left_open && !right_open) {
+                    log_turn('L');
+                    turn_timer = HAL_GetTick();
+                    state = S_TURN_LEFT;
+                } else if (right_open && !left_open) {
+                    log_turn('R');
+                    turn_timer = HAL_GetTick();
+                    state = S_TURN_RIGHT;
+                } else if (left_open && right_open) {
+                    /* T-junction: prefer left (or change to 'R' if needed) */
+                    DBGLN("[TURN] T-junction → choosing LEFT");
+                    log_turn('L');
+                    turn_timer = HAL_GetTick();
+                    state = S_TURN_LEFT;
+                } else {
+                    /* Dead end: U-turn (two left spins) — extend duration */
+                    DBGLN("[TURN] Dead-end → U-turn");
+                    log_turn('L');
+                    log_turn('L');
+                    turn_timer = HAL_GetTick();
+                    /* Reuse S_TURN_LEFT; TURN_DURATION_MS * 2 handled below */
+                    state = S_TURN_LEFT;
+                }
+            } else {
+                /* Slowing toward front wall */
+                drive(SLOW_SPEED, SLOW_SPEED);
+            }
+            break;
+        }
+
+        /* ─── TURN_LEFT: spin until timer expires ───────── */
+        case S_TURN_LEFT:
+            spin_left();
+            if (HAL_GetTick() - turn_timer >= TURN_DURATION_MS) {
+                stop_robot();
+                HAL_Delay(100);
+                turn_timer = HAL_GetTick();
+                state = S_POST_TURN;
+            }
+            break;
+
+        /* ─── TURN_RIGHT: spin until timer expires ──────── */
+        case S_TURN_RIGHT:
+            spin_right();
+            if (HAL_GetTick() - turn_timer >= TURN_DURATION_MS) {
+                stop_robot();
+                HAL_Delay(100);
+                turn_timer = HAL_GetTick();
+                state = S_POST_TURN;
+            }
+            break;
+
+        /* ─── POST_TURN: short straight to re-acquire walls  */
+        case S_POST_TURN:
+            drive(SLOW_SPEED, SLOW_SPEED);
+            /* Give sensors 400 ms to stabilise, then resume */
+            if (HAL_GetTick() - turn_timer >= 400) {
+                state = S_DRIVE;
+            }
+            break;
+
+        /* ─── STOP: end of track (trigger manually for now) */
+        case S_STOP:
+            stop_robot();
+            send_summary();
+            while (1); /* hang until reset */
+            break;
+
+        case S_IDLE:
         default:
             stop_robot();
             break;
         }
 
-        HAL_Delay(100);
+        HAL_Delay(50); /* 20 Hz loop — fast enough, not too spammy */
     }
 }
