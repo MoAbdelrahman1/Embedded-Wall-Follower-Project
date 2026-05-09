@@ -63,11 +63,11 @@ void Motor_SetDirection(Motor_t *motor, MotorDirection_t direction)
 {
     if (motor->en_pin == MOTOR_A_EN_PIN) {
         if (direction == MOTOR_FORWARD) {
-            GPIOA->BSRR = (1U << 1);         /* PA1 high */
-            GPIOA->BSRR = (1U << (2+16));    /* PA2 low  */
-        } else if (direction == MOTOR_BACKWARD) {
             GPIOA->BSRR = (1U << (1+16));    /* PA1 low  */
             GPIOA->BSRR = (1U << 2);         /* PA2 high */
+        } else if (direction == MOTOR_BACKWARD) {
+            GPIOA->BSRR = (1U << 1);         /* PA1 high */
+            GPIOA->BSRR = (1U << (2+16));    /* PA2 low  */
         } else {
             GPIOA->BSRR = (1U << (1+16));
             GPIOA->BSRR = (1U << (2+16));
