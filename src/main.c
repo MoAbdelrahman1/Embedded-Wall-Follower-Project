@@ -44,9 +44,9 @@
  * Start at 500 ms, bump ±50 ms until you get clean 90°.      */
 #define TURN_PULSES_90       240
 #define TURN_TIMEOUT_MS      1500
-#define TURN_DURATION_MS     450
-#define POST_TURN_NO_ADJUST_MS 400
-#define POST_TURN_SLOW_ADJUST_MS 600
+#define TURN_DURATION_MS     500
+#define POST_TURN_NO_ADJUST_MS 500
+#define POST_TURN_SLOW_ADJUST_MS 800
 
 /* ── Max turns the track can have ───────────────────────────*/
 #define MAX_TURNS            32
