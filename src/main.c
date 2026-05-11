@@ -1,6 +1,5 @@
-/* ============================================================
- * main.c – Refined, Sensor-Based Turning (side-specific stop)
- * ============================================================ */
+﻿
+/* Wall-following robot control with sensor-based turn exits. */
 
 #include "config.h"
 #include "hal.h"
@@ -11,7 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ── Sensor pins ─────────────────────────────────────────── */
+/* Ultrasonic sensors are wired on GPIOB. */
 #define FRONT_TRIG  4
 #define FRONT_ECHO  5
 #define LEFT_TRIG   6
@@ -19,7 +18,7 @@
 #define RIGHT_TRIG  8
 #define RIGHT_ECHO  9
 
-/* ── Distance thresholds ────────────────────────────────── */
+/* Distances are in centimeters. */
 #define FRONT_SLOW_CM        35
 #define FRONT_STOP_CM        26
 #define FRONT_CLEAR_CM       30
@@ -29,9 +28,9 @@
 #define SIDE_TOLERANCE_CM     3
 
 #define SIDE_NEAR_CM          8
-#define SIDE_ENTER_CM        25   // used for side-specific turn finish
+#define SIDE_ENTER_CM        25   // Wall seen after entering the new lane.
 
-/* ── Speeds ─────────────────────────────────────────────── */
+/* PWM speeds are 0..999. */
 #define FWD_SPEED            600
 #define SLOW_SPEED           360
 #define PRE_TURN_SPEED       260
@@ -41,7 +40,7 @@
 
 #define TURN_SPEED           320
 
-/* ── Safety / timing ────────────────────────────────────── */
+/* Timeouts keep the robot from getting stuck in a turn. */
 #define TURN_TIMEOUT_MS      900
 #define POST_TURN_MS         250
 
@@ -57,7 +56,6 @@ typedef enum {
     S_STOP
 } FSM_State_t;
 
-/* ── Globals ────────────────────────────────────────────── */
 static FSM_State_t state = S_IDLE;
 
 static uint8_t turn_count = 0;
@@ -65,7 +63,6 @@ static char turn_seq[MAX_TURNS];
 
 static uint32_t turn_timer = 0;
 
-/* ── Helpers ────────────────────────────────────────────── */
 
 static uint16_t clamp(int32_t v)
 {
@@ -98,7 +95,7 @@ static void spin_right(void)
     Motor_Drive(&MotorB, MOTOR_BACKWARD, TURN_SPEED);
 }
 
-/* active brake to reduce overshoot */
+/* Brief reverse torque reduces turn overshoot. */
 static void brake_after_left(void)
 {
     Motor_Drive(&MotorA, MOTOR_FORWARD, 120);
@@ -170,7 +167,6 @@ static void send_summary(void)
         ESP_Wifi_SendText(buf);
 }
 
-/* ── MAIN ───────────────────────────────────────────────── */
 
 int main(void)
 {
@@ -205,7 +201,6 @@ int main(void)
 
         switch (state) {
 
-        /* ───────── DRIVE ───────── */
 
         case S_DRIVE: {
 
@@ -222,7 +217,7 @@ int main(void)
             int32_t lspd = base;
             int32_t rspd = base;
 
-            /* wall too close */
+            // Give the near wall priority over centering.
             if (left <= SIDE_NEAR_CM && left < right) {
                 lspd = SLOW_SPEED;
                 rspd = SLOW_SPEED - CLOSE_CORRECTION;
@@ -232,7 +227,7 @@ int main(void)
                 rspd = SLOW_SPEED;
             }
             else {
-                /* center using left-right error */
+                // Center between both side walls.  
                 int32_t err = (int32_t)left - (int32_t)right;
 
                 if (err > SIDE_TOLERANCE_CM)
@@ -245,7 +240,6 @@ int main(void)
             break;
         }
 
-        /* ───────── PRE TURN ───────── */
 
         case S_PRE_TURN: {
 
@@ -284,13 +278,12 @@ int main(void)
             break;
         }
 
-        /* ───────── TURN LEFT ───────── */
 
         case S_TURN_LEFT:
 
             spin_left();
 
-            // stop when left wall appears (entered new lane) and front is clear
+            // Stop when the new lane is clear and the left wall is visible.
             if (front > FRONT_CLEAR_CM &&
                 left < SIDE_ENTER_CM) {
 
@@ -306,13 +299,12 @@ int main(void)
 
             break;
 
-        /* ───────── TURN RIGHT ───────── */
 
         case S_TURN_RIGHT:
 
             spin_right();
 
-            // stop when right wall appears (entered new lane) and front is clear
+            // Stop when the new lane is clear and the right wall is visible.
             if (front > FRONT_CLEAR_CM &&
                 right < SIDE_ENTER_CM) {
 
@@ -328,11 +320,10 @@ int main(void)
 
             break;
 
-        /* ───────── POST TURN ───────── */
 
         case S_POST_TURN:
 
-            // short straight recovery
+            // Move straight briefly before normal side correction resumes.
             drive(SLOW_SPEED, SLOW_SPEED);
 
             if (HAL_GetTick() - turn_timer >= POST_TURN_MS) {
@@ -340,7 +331,6 @@ int main(void)
             }
             break;
 
-        /* ───────── STOP ───────── */
 
         case S_STOP:
 
